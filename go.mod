@@ -3,7 +3,7 @@ module github.com/codeharik/GoMQ
 go 1.23.1
 
 require (
-	github.com/YuriyNasretdinov/chukcha v0.0.0-20220806150531-8aec21ddfcda
+	github.com/phayes/freeport v0.0.0-20220201140144-74d24b5ae9f5
 	github.com/valyala/fasthttp v1.58.0
 )
 
