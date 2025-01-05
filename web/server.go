@@ -1,108 +1,58 @@
 package web
 
 import (
-	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync"
 
-	"github.com/codeharik/GoMQ/replication"
 	"github.com/codeharik/GoMQ/server"
+	"github.com/codeharik/GoMQ/server/replication"
 	"github.com/valyala/fasthttp"
+	"go.etcd.io/etcd/clientv3"
 )
-
-const maxReadSize = 16 * 1024 * 1024 // 16 MiB
 
 // Server implements a web server
 type Server struct {
-	logger       *log.Logger
+	etcd         *clientv3.Client
 	instanceName string
 	dirname      string
 	listenAddr   string
+	replStorage  *replication.Storage
 
-	replStorage *replication.Storage
-
-	getOnDisk GetOnDiskFn
+	m        sync.Mutex
+	storages map[string]*server.OnDisk
 }
 
-type GetOnDiskFn func(category string) (*server.OnDisk, error)
-
 // NewServer creates *Server
-func NewServer(logger *log.Logger, instanceName string, dirname string, listenAddr string, replStorage *replication.Storage, getOnDisk GetOnDiskFn) *Server {
+func NewServer(etcd *clientv3.Client, instanceName string, dirname string, listenAddr string, replStorage *replication.Storage) *Server {
 	return &Server{
-		logger:       logger,
+		etcd:         etcd,
 		instanceName: instanceName,
 		dirname:      dirname,
 		listenAddr:   listenAddr,
 		replStorage:  replStorage,
-		getOnDisk:    getOnDisk,
+		storages:     make(map[string]*server.OnDisk),
 	}
-}
-
-type errWithCode struct {
-	code int
-	text string
-}
-
-// Error implements `error` type interface
-func (e *errWithCode) Error() string {
-	return e.text
-}
-
-// Code returns an HTTP status code of the response.
-func (e *errWithCode) Code() int {
-	return e.code
-}
-
-type withCode interface {
-	Code() int
-}
-
-func (s *Server) withCode(err error, code int) *errWithCode {
-	return &errWithCode{code: code, text: err.Error()}
 }
 
 func (s *Server) handler(ctx *fasthttp.RequestCtx) {
-	var err error
-
 	switch string(ctx.Path()) {
 	case "/write":
-		err = s.writeHandler(ctx)
+		s.writeHandler(ctx)
 	case "/read":
-		err = s.readHandler(ctx)
+		s.readHandler(ctx)
 	case "/ack":
-		err = s.ackHandler(ctx)
-	case "/replication/ack":
-		err = s.replicationAckHandler(ctx)
-	case "/replication/events":
-		err = s.replicationEventsHandler(ctx)
+		s.ackHandler(ctx)
 	case "/listChunks":
-		err = s.listChunksHandler(ctx)
-	case "/listCategories":
-		err = s.listCategoriesHandler(ctx)
+		s.listChunksHandler(ctx)
 	default:
-		err = &errWithCode{code: fasthttp.StatusNotFound, text: "not found"}
+		ctx.WriteString("Hello world!")
 	}
-
-	if err == nil {
-		return
-	}
-
-	var ec withCode
-	if errors.As(err, &ec) {
-		ctx.Response.SetStatusCode(ec.Code())
-	} else {
-		ctx.Response.SetStatusCode(fasthttp.StatusInternalServerError)
-	}
-
-	ctx.WriteString(err.Error())
 }
 
 // TODO: check validity of a file name on Windows.
@@ -128,203 +78,123 @@ func (s *Server) getStorageForCategory(category string) (*server.OnDisk, error) 
 		return nil, errors.New("invalid category name")
 	}
 
-	return s.getOnDisk(category)
+	s.m.Lock()
+	defer s.m.Unlock()
+
+	storage, ok := s.storages[category]
+	if ok {
+		return storage, nil
+	}
+
+	dir := filepath.Join(s.dirname, category)
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		return nil, fmt.Errorf("creating directory for the category: %v", err)
+	}
+
+	storage, err := server.NewOnDisk(dir, category, s.instanceName, s.replStorage)
+	if err != nil {
+		return nil, err
+	}
+
+	s.storages[category] = storage
+	return storage, nil
 }
 
-func (s *Server) writeHandler(ctx *fasthttp.RequestCtx) error {
+func (s *Server) writeHandler(ctx *fasthttp.RequestCtx) {
 	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
 	if err != nil {
-		return s.withCode(err, fasthttp.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(err.Error())
+		return
 	}
 
-	chunkName, off, err := storage.Write(ctx, ctx.Request.Body())
-	if err != nil {
-		return err
+	if err := storage.Write(ctx, ctx.Request.Body()); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.WriteString(err.Error())
 	}
-
-	minSyncReplicas, err := ctx.QueryArgs().GetUint("min_sync_replicas")
-	if err != nil && err != fasthttp.ErrNoArgValue {
-		return s.withCode(err, fasthttp.StatusBadRequest)
-	} else if minSyncReplicas > 0 {
-		waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
-		defer cancel()
-
-		if err := storage.Wait(waitCtx, chunkName, uint64(off), uint(minSyncReplicas)); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
-func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) error {
+func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) {
 	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
 	if err != nil {
-		return s.withCode(err, fasthttp.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(err.Error())
+		return
 	}
 
 	chunk := ctx.QueryArgs().Peek("chunk")
 	if len(chunk) == 0 {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `chunk` GET param: chunk name must be provided"}
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString("bad `chunk` GET param: chunk name must be provided")
+		return
 	}
 
 	size, err := ctx.QueryArgs().GetUint("size")
 	if err != nil {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: fmt.Sprintf("bad `size` GET param: %v", err)}
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(fmt.Sprintf("bad `size` GET param: %v", err))
+		return
 	}
 
-	if err := storage.Ack(ctx, string(chunk), uint64(size)); err != nil {
-		return err
+	if err := storage.Ack(string(chunk), uint64(size)); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.WriteString(err.Error())
 	}
-
-	return nil
 }
 
-// replicationAckHandler is used to let chunk owner (us) know that
-// replica has successfully downloaded the chunk.
-func (s *Server) replicationAckHandler(ctx *fasthttp.RequestCtx) error {
+func (s *Server) readHandler(ctx *fasthttp.RequestCtx) {
 	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
 	if err != nil {
-		return s.withCode(err, fasthttp.StatusBadRequest)
-	}
-
-	chunk := ctx.QueryArgs().Peek("chunk")
-	if len(chunk) == 0 {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `chunk` GET param: chunk name must be provided"}
-	}
-
-	// instance is the name of instance that has successfully downloaded the
-	// respective chunk part.
-	instance := ctx.QueryArgs().Peek("instance")
-	if len(instance) == 0 {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `instance` GET param: chunk name must be provided"}
-	}
-
-	size, err := ctx.QueryArgs().GetUint("size")
-	if err != nil {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `size` GET param: chunk name must be provided"}
-	}
-
-	storage.ReplicationAck(ctx, string(chunk), string(instance), uint64(size))
-	return nil
-}
-
-// registerReplicationEvents is sending the events stream to the connected replica.
-func (s *Server) replicationEventsHandler(ctx *fasthttp.RequestCtx) error {
-	// instance is the name of the connected replica.
-	instance := ctx.QueryArgs().Peek("instance")
-	if len(instance) == 0 {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `instance` GET param: replica name must be provided"}
-	}
-
-	eventsCh := make(chan replication.Message, 1000)
-
-	ctx.Response.SetBodyStreamWriter(func(w *bufio.Writer) {
-		wr := json.NewEncoder(w)
-
-		for {
-			select {
-			case ch, ok := <-eventsCh:
-				if !ok {
-					return
-				}
-
-				if err := wr.Encode(ch); err != nil {
-					s.logger.Printf("error encoding event: %v", err)
-					return
-				}
-			case <-time.After(10 * time.Second):
-				if err := wr.Encode(&replication.Chunk{}); err != nil {
-					s.logger.Printf("error encoding heartbeat event: %v", err)
-					return
-				}
-			}
-
-			if err := w.Flush(); err != nil {
-				s.logger.Printf("error flushing event: %v", err)
-				return
-			}
-		}
-	})
-
-	s.replStorage.RegisterReplica(string(instance), eventsCh)
-	return nil
-}
-
-func (s *Server) readHandler(ctx *fasthttp.RequestCtx) error {
-	chunk := ctx.QueryArgs().Peek("chunk")
-	if len(chunk) == 0 {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: "bad `chunk` GET param: chunk name must be provided"}
-	}
-
-	fromReplication, _ := ctx.QueryArgs().GetUint("from_replication")
-	if fromReplication == 1 {
-		// s.logger.Printf("sleeping for 8 seconds for request from replication for chunk %v", string(chunk))
-		// time.Sleep(time.Second * 8)
-	}
-
-	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
-	if err != nil {
-		return s.withCode(err, fasthttp.StatusBadRequest)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(err.Error())
+		return
 	}
 
 	off, err := ctx.QueryArgs().GetUint("off")
 	if err != nil {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: fmt.Sprintf("bad `off` GET param: %v", err)}
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(fmt.Sprintf("bad `off` GET param: %v", err))
+		return
 	}
 
-	maxSize, err := ctx.QueryArgs().GetUint("max_size")
+	maxSize, err := ctx.QueryArgs().GetUint("maxSize")
 	if err != nil {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: fmt.Sprintf("bad `max_size` GET param: %v", err)}
-	} else if maxSize > maxReadSize {
-		return &errWithCode{code: fasthttp.StatusBadRequest, text: fmt.Sprintf("bad `max_size` GET param: size can't exceed %d bytes", maxReadSize)}
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(fmt.Sprintf("bad `maxSize` GET param: %v", err))
+		return
+	}
+
+	chunk := ctx.QueryArgs().Peek("chunk")
+	if len(chunk) == 0 {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString("bad `chunk` GET param: chunk name must be provided")
+		return
 	}
 
 	err = storage.Read(string(chunk), uint64(off), uint64(maxSize), ctx)
 	if err != nil && err != io.EOF {
-		if errors.Is(err, os.ErrNotExist) {
-			return s.withCode(err, fasthttp.StatusNotFound)
-		}
-		return err
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.WriteString(err.Error())
+		return
 	}
-
-	return nil
 }
 
-func (s *Server) listChunksHandler(ctx *fasthttp.RequestCtx) error {
+func (s *Server) listChunksHandler(ctx *fasthttp.RequestCtx) {
 	storage, err := s.getStorageForCategory(string(ctx.QueryArgs().Peek("category")))
 	if err != nil {
-		return s.withCode(err, fasthttp.StatusBadRequest)
-	}
-
-	fromReplication, _ := ctx.QueryArgs().GetUint("from_replication")
-	if fromReplication == 1 {
-		// c.logger.Printf("sleeping for 8 seconds for request from replication for listing chunks")
-		// time.Sleep(time.Second * 8)
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(err.Error())
+		return
 	}
 
 	chunks, err := storage.ListChunks()
 	if err != nil {
-		return err
+		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+		ctx.WriteString(err.Error())
+		return
 	}
 
-	return json.NewEncoder(ctx).Encode(chunks)
-}
-
-func (s *Server) listCategoriesHandler(ctx *fasthttp.RequestCtx) error {
-	res := make([]string, 0)
-	dis, err := os.ReadDir(s.dirname)
-	if err != nil {
-		return err
-	}
-
-	for _, d := range dis {
-		if d.IsDir() {
-			res = append(res, d.Name())
-		}
-	}
-
-	return json.NewEncoder(ctx).Encode(res)
+	json.NewEncoder(ctx).Encode(chunks)
 }
 
 // Serve listens to HTTP connections

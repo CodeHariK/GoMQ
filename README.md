@@ -1,6 +1,4 @@
 # chukcha
-<a href='https://github.com/jpoles1/gopherbadger' target='_blank'>![gopherbadger-tag-do-not-edit](https://img.shields.io/badge/Go%20Coverage-34%25-brightgreen.svg?longCache=true&style=flat)</a>
-
 Easy to use distributed event bus similar to Kafka.
 
 The event bus is designed to be used as a persistent intermediate storage buffer for any kinds of events or logs that you might want.
@@ -17,7 +15,7 @@ The youtube playlist to see live development: https://www.youtube.com/watch?v=t3
 
 # Requirements
 
-Go 1.18+ is needed to build Chukcha.
+Go 1.16+ is needed to build Chukcha.
 
 # Features (work in progress)
 
@@ -27,7 +25,7 @@ Go 1.18+ is needed to build Chukcha.
 
 # Limitations
 
-1. The maximum supported size is 4 MiB per message.
+1. The maximum supported size is 1 MiB per message.
 2. Each message has to be separated by a new line character (`\n`).
 3. The maximum default write batch size is 4 MiB.
 4. Maximum memory consumption is around `(write batch size) * 2` (8 MiB with default settings) per connection. TODO: memory consumption per connection can be brought down significantly if using a custom protocol on top of HTTP.
@@ -109,21 +107,9 @@ If you really want to use Chukcha, please refer to the simple Go client library 
 
 # TODOs:
 
+1. Limit for the maximum message size is 1 MiB, otherwise we can no longer serve results from disk because we read from disk in 1 MiB chunks.
 1. Handle situations when we run out of disk space or the number of inodes.
+1. Compute code coverage.
+1. Introduce replication.
 1. Write replication tests
-1. Write a garbage collector for tombstones (".acknowledged" files) and make a fallback mechanism to acknowledge chunks when we failed to replicate acknowledge request.
-1. Introduce options arguments when creating a simple client.
-1. Streaming replication.
-
-# Production readiness TODOs:
-
-1. Tests cover all important components of the system.
-2. Handle typical failure scenarios:
- - Running out of disk space or inodes
- - Resilience against process / server crashes
- - Completely lost network connectivity
- - Having significant packet delays
- - Losing the server completely
- - Misconfiguration
-3. Having documentation for setting things up and troubleshooting.
-4. 
+1. Rotate chunks not only based on the size but also based on time passed, to allow chunks downloaded from other servers to be forcefully finalised upon failure.

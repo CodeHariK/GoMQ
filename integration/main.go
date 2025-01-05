@@ -3,70 +3,51 @@ package integration
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"syscall"
+	"strings"
 	"time"
 
-	"github.com/codeharik/GoMQ/replication"
-	"github.com/codeharik/GoMQ/server"
+	"github.com/codeharik/GoMQ/server/replication"
 	"github.com/codeharik/GoMQ/web"
+	"go.etcd.io/etcd/clientv3"
 )
-
-type InitArgs struct {
-	LogWriter io.Writer
-	Peers     []replication.Peer
-
-	InstanceName string
-
-	DirName    string
-	ListenAddr string
-
-	MaxChunkSize        uint64
-	RotateChunkInterval time.Duration
-
-	PProfAddr string
-
-	// The next set of parameters is only set in tests.
-	DisableAcknowledge bool
-}
 
 // InitAndServe checks validity of the supplied arguments and starts
 // the web server on the specified port.
-func InitAndServe(a InitArgs) error {
-	logger := log.New(a.LogWriter, "["+a.InstanceName+"] ", log.LstdFlags|log.Lmicroseconds)
+func InitAndServe(etcdAddr string, instanceName string, dirname string, listenAddr string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	etcdClient, err := clientv3.New(clientv3.Config{
+		Endpoints:   strings.Split(etcdAddr, ","),
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		return fmt.Errorf("creating new client: %w", err)
+	}
+	defer etcdClient.Close()
 
-	filename := filepath.Join(a.DirName, "running.lock")
+	_, err = etcdClient.Put(ctx, "test", "test")
+	if err != nil {
+		return fmt.Errorf("could not set the test key: %w", err)
+	}
+
+	_, err = etcdClient.Put(ctx, "peers/"+instanceName, listenAddr)
+	if err != nil {
+		return fmt.Errorf("could not register peer address in etcd: %w", err)
+	}
+
+	filename := filepath.Join(dirname, "write_test")
 	fp, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return fmt.Errorf("creating test file %q: %s", filename, err)
 	}
-	defer fp.Close()
+	fp.Close()
+	os.Remove(fp.Name())
 
-	if err := syscall.Flock(int(fp.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		return fmt.Errorf("getting file lock for file %q failed, another instance is running? (error: %v)", filename, err)
-	}
+	s := web.NewServer(etcdClient, instanceName, dirname, listenAddr, replication.NewStorage(etcdClient, instanceName))
 
-	if a.PProfAddr != "" {
-		go func() {
-			logger.Printf("Starting pprof server on %q", a.PProfAddr)
-			logger.Println(http.ListenAndServe(a.PProfAddr, nil))
-		}()
-	}
-
-	replStorage := replication.NewStorage(logger, a.InstanceName)
-
-	creator := server.NewOnDiskCreator(logger, a.DirName, a.InstanceName, replStorage, a.MaxChunkSize, a.RotateChunkInterval)
-
-	s := web.NewServer(logger, a.InstanceName, a.DirName, a.ListenAddr, replStorage, creator.Get)
-
-	replClient := replication.NewClient(logger, a.DirName, creator, a.Peers, a.InstanceName)
-	go replClient.Loop(context.Background())
-
-	logger.Printf("Listening connections at %q", a.ListenAddr)
+	log.Printf("Listening connections")
 	return s.Serve()
 }
