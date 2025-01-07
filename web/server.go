@@ -9,25 +9,14 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const defaultBufSize = 512 * 1024
-
-// Storage defines an interface for the backend storage.
-// It can be either on-disk, in-memory, or other types of storage.
-type Storage interface {
-	Write(msgs []byte) error
-	ListChunks() ([]server.Chunk, error)
-	Read(chunk string, off uint64, maxSize uint64, w io.Writer) error
-	Ack(chunk string) error
-}
-
 // Server implements a web server
 type Server struct {
-	s    Storage
+	s    *server.OnDisk
 	port uint
 }
 
 // NewServer creates *Server
-func NewServer(s Storage, port uint) *Server {
+func NewServer(s *server.OnDisk, port uint) *Server {
 	return &Server{s: s, port: port}
 }
 
@@ -57,11 +46,18 @@ func (s *Server) ackHandler(ctx *fasthttp.RequestCtx) {
 	chunk := ctx.QueryArgs().Peek("chunk")
 	if len(chunk) == 0 {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteString(fmt.Sprintf("bad `chunk` GET param: chunk name must be provided"))
+		ctx.WriteString("bad `chunk` GET param: chunk name must be provided")
 		return
 	}
 
-	if err := s.s.Ack(string(chunk)); err != nil {
+	size, err := ctx.QueryArgs().GetUint("size")
+	if err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		ctx.WriteString(fmt.Sprintf("bad `size` GET param: %v", err))
+		return
+	}
+
+	if err := s.s.Ack(string(chunk), int64(size)); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		ctx.WriteString(err.Error())
 	}
@@ -85,7 +81,7 @@ func (s *Server) readHandler(ctx *fasthttp.RequestCtx) {
 	chunk := ctx.QueryArgs().Peek("chunk")
 	if len(chunk) == 0 {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.WriteString(fmt.Sprintf("bad `chunk` GET param: chunk name must be provided"))
+		ctx.WriteString("bad `chunk` GET param: chunk name must be provided")
 		return
 	}
 

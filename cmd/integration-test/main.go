@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"go/build"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -51,12 +53,18 @@ func runTest() error {
 	port := 7357 // "test" in l33t
 
 	// TODO: make db path random
-	dbPath := "/tmp/chukcha.db"
-	os.Remove(dbPath)
+	dbPath := filepath.Join(os.TempDir(), "chukcha")
+	os.RemoveAll(dbPath)
+	os.Mkdir(dbPath, 0o777)
+
+	// Initialise the database contents with
+	// a not easy-to-guess contents that must
+	// be preserved when writing to this directory.
+	ioutil.WriteFile(filepath.Join(dbPath, "chunk1"), []byte("12345\n"), 0o666)
 
 	log.Printf("Running chukcha on port %d", port)
 
-	cmd := exec.Command(goPath+"/bin/chukcha", "-inmem", "-filename="+dbPath, fmt.Sprintf("-port=%d", port))
+	cmd := exec.Command(goPath+"/bin/chukcha", "-dirname="+dbPath, fmt.Sprintf("-port=%d", port))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -79,21 +87,61 @@ func runTest() error {
 
 	s := client.NewSimple([]string{fmt.Sprintf("http://localhost:%d", port)})
 
-	want, err := send(s)
+	want, got, err := sendAndReceiveConcurrently(s)
 	if err != nil {
-		return fmt.Errorf("send: %v", err)
+		return err
 	}
 
-	got, err := receive(s)
-	if err != nil {
-		return fmt.Errorf("receive: %v", err)
-	}
+	// The contents of the chunk that already existed.
+	want += 12345
 
 	if want != got {
-		return fmt.Errorf("the expected sum %d is not equal to the actual sum %d", want, got)
+		return fmt.Errorf("the expected sum %d is not equal to the actual sum %d (delivered %1.f%%)", want, got, (float64(got)/float64(want))*100)
 	}
 
 	return nil
+}
+
+type sumAndErr struct {
+	sum int64
+	err error
+}
+
+func sendAndReceiveConcurrently(s *client.Simple) (want, got int64, err error) {
+	wantCh := make(chan sumAndErr, 1)
+	gotCh := make(chan sumAndErr, 1)
+	sendFinishedCh := make(chan bool, 1)
+
+	go func() {
+		want, err := send(s)
+		log.Printf("Send finished")
+
+		wantCh <- sumAndErr{
+			sum: want,
+			err: err,
+		}
+		sendFinishedCh <- true
+	}()
+
+	go func() {
+		got, err := receive(s, sendFinishedCh)
+		gotCh <- sumAndErr{
+			sum: got,
+			err: err,
+		}
+	}()
+
+	wantRes := <-wantCh
+	if wantRes.err != nil {
+		return 0, 0, fmt.Errorf("send: %v", wantRes.err)
+	}
+
+	gotRes := <-gotCh
+	if gotRes.err != nil {
+		return 0, 0, fmt.Errorf("receive: %v", gotRes.err)
+	}
+
+	return wantRes.sum, gotRes.sum, err
 }
 
 func send(s *client.Simple) (sum int64, err error) {
@@ -137,7 +185,7 @@ func send(s *client.Simple) (sum int64, err error) {
 	return sum, nil
 }
 
-func receive(s *client.Simple) (sum int64, err error) {
+func receive(s *client.Simple, sendFinishedCh chan bool) (sum int64, err error) {
 	buf := make([]byte, maxBufferSize)
 
 	var parseTime time.Duration
@@ -148,10 +196,24 @@ func receive(s *client.Simple) (sum int64, err error) {
 
 	trimNL := func(r rune) bool { return r == '\n' }
 
+	sendFinished := false
+
 	for {
+		select {
+		case <-sendFinishedCh:
+			log.Printf("Receive: got information that send finished")
+			sendFinished = true
+		default:
+		}
+
 		res, err := s.Receive(buf)
 		if errors.Is(err, io.EOF) {
-			return sum, nil
+			if sendFinished {
+				return sum, nil
+			}
+
+			time.Sleep(time.Millisecond * 10)
+			continue
 		} else if err != nil {
 			return 0, err
 		}
